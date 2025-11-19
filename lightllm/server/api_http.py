@@ -286,6 +286,18 @@ async def generate_image(request: Request) -> Response:
         return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
 
 
+@app.post("/pause_generation")
+async def pause_generation():
+    await g_objs.httpserver_manager.pause_generation()
+    return Response(content="Generation paused and drained.", status_code=200)
+
+
+@app.post("/continue_generation")
+async def continue_generation():
+    await g_objs.httpserver_manager.continue_generation()
+    return Response(content="Generation continued.", status_code=200)
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def completions_v2(request: ChatCompletionRequestV2, raw_request: Request) -> Response:
     if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:

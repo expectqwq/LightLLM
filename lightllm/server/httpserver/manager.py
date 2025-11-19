@@ -134,6 +134,8 @@ class HttpServerManager:
         # If the timemark is not updated for a pre-set time, a prob request will be sent to the backend.
         self.latest_success_infer_time_mark = SharedInt(f"{get_unique_server_name()}_latest_success_infer_time_mark")
         self.latest_success_infer_time_mark.set_value(int(time.time()))
+        self.is_pause = False
+        self.is_pause_cond = asyncio.Condition()
         return
 
     def _log_stage_timing(self, group_request_id: int, start_time: float, stage: str, **kwargs):
@@ -324,6 +326,8 @@ class HttpServerManager:
         )
 
         try:
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
             original_multimodal_params = None
             if self.is_multinode_tp_master:
                 original_multimodal_params = copy.deepcopy(multimodal_params)
@@ -867,6 +871,23 @@ class HttpServerManager:
             req.is_aborted = True
         logger.warning(f"aborted group_request_id {group_req_objs.group_req_id}")
         return True
+
+    async def pause_generation(self):
+        """Stop admission and drain both text and image work."""
+
+        async with self.is_pause_cond:
+            self.is_pause = True
+        for group_req_id in list(self.req_id_to_out_inf):
+            await self.abort(group_req_id)
+        while self.req_id_to_out_inf or (
+            self.args.enable_multimodal_x2i and self.req_id_to_x2i_reqs
+        ):
+            await asyncio.sleep(0.05)
+
+    async def continue_generation(self):
+        async with self.is_pause_cond:
+            self.is_pause = False
+            self.is_pause_cond.notify_all()
 
     async def recycle_resource_loop(self):
         pre_time_mark = time.time()
