@@ -343,6 +343,7 @@ class HttpServerManager:
             image_count=image_count,
         )
 
+        owns_low_level_session = False
         try:
             admitted_session = bool(
                 request is not None
@@ -351,6 +352,8 @@ class HttpServerManager:
             if not admitted_session:
                 async with self.is_pause_cond:
                     await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+                    self.generation_session_count += 1
+                    owns_low_level_session = True
             original_multimodal_params = None
             if self.is_multinode_tp_master:
                 original_multimodal_params = copy.deepcopy(multimodal_params)
@@ -508,6 +511,13 @@ class HttpServerManager:
             await self.abort(group_request_id)
 
             raise e
+        finally:
+            if owns_low_level_session:
+                async with self.is_pause_cond:
+                    self.generation_session_count -= 1
+                    if self.generation_session_count < 0:
+                        raise RuntimeError("generation session counter underflow")
+                    self.is_pause_cond.notify_all()
         return
 
     async def generate_image(

@@ -365,7 +365,14 @@ async def rl_rollouts(request: RLRolloutRequest, raw_request: Request):
 def _trace_path(bundle_id: str):
     if not re.fullmatch(r"[a-f0-9]{32}", bundle_id):
         raise HTTPException(status_code=400, detail="invalid trace bundle id")
-    return os.path.join(os.getenv("MOVA_RL_TRACE_DIR", "/tmp/mova_rl_traces"), f"{bundle_id}.safetensors")
+    path = os.path.join(os.getenv("MOVA_RL_TRACE_DIR", "/tmp/mova_rl_traces"), f"{bundle_id}.safetensors")
+    if os.path.isfile(path):
+        ttl = int(os.getenv("MOVA_RL_TRACE_TTL", "3600"))
+        if ttl <= 0:
+            raise HTTPException(status_code=500, detail="invalid RL trace TTL")
+        if os.path.getmtime(path) < time.time() - ttl:
+            os.unlink(path)
+    return path
 
 
 @app.get("/v1/rl/traces/{bundle_id}")
