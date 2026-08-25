@@ -47,6 +47,7 @@ from lightllm.common.basemodel.triton_kernel.gather_token_id import scatter_toke
 from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
 from .multi_level_kv_cache import MultiLevelKvCacheModule
 from .past_kv_cache import PastKVCacheModule
+from lightllm.utils.rl_weight_update import DistributedWeightReceiver
 
 
 class ModeBackend:
@@ -174,6 +175,9 @@ class ModeBackend:
         }
         self.model, self.is_multimodal = get_model(model_cfg, model_kvargs)
         self.model: TpPartBaseModel = self.model  # for easy typing
+        self.rl_weight_receiver = DistributedWeightReceiver(
+            consumer="language", device=torch.device(f"cuda:{get_current_device_id()}")
+        )
         set_random_seed(2147483647)
 
         radix_cache_class = self.model.radix_cache_class
@@ -281,6 +285,38 @@ class ModeBackend:
 
     def get_max_total_token_num(self):
         return self.model.mem_manager.size
+
+    def init_rl_weight_group(self, payload):
+        payload = dict(payload)
+        payload["master_port"] = payload["master_ports"]["language"]
+        payload["world_size"] = payload["language_world_size"]
+        payload["group_name"] = f"{payload.get('group_name', 'weight_update_group')}:language"
+        return self.rl_weight_receiver.init_group(payload, rank=1 + self.global_rank)
+
+    def update_rl_weights(self, payload):
+        payload = dict(payload)
+        payload["group_name"] = f"{payload.get('group_name', 'weight_update_group')}:language"
+        tensors, receipt = self.rl_weight_receiver.receive(payload)
+        self.model.load_weights(tensors)
+        if self.radix_cache is not None:
+            self.radix_cache.clear_tree_nodes()
+        torch.cuda.empty_cache()
+        receipt["policy_version"] = payload["policy_version"]
+        return receipt
+
+    def update_rl_weights_from_tensor(self, payload):
+        tensors, receipt = self.rl_weight_receiver.decode_bundle(payload)
+        self.model.load_weights(tensors)
+        if self.radix_cache is not None:
+            self.radix_cache.clear_tree_nodes()
+        torch.cuda.empty_cache()
+        receipt["policy_version"] = payload["policy_version"]
+        return receipt
+
+    def destroy_rl_weight_group(self, payload):
+        return self.rl_weight_receiver.destroy_group(
+            f"{payload.get('group_name', 'weight_update_group')}:language"
+        )
 
     def infer_loop(self):
         raise NotImplementedError()

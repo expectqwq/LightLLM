@@ -37,8 +37,8 @@ import multiprocessing as mp
 from typing import AsyncGenerator, Union
 from typing import Callable
 from lightllm.server import TokenLoad
-from fastapi import BackgroundTasks, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, StreamingResponse, JSONResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from lightllm.server.core.objs.sampling_params import SamplingParams
 from lightllm.server.core.objs import StartArgs
 from .multimodal_params import MultimodalParams
@@ -63,6 +63,13 @@ from .api_models import (
     ModelListResponse,
 )
 from .build_prompt import build_prompt, init_tokenizer
+from .rl_models import (
+    DestroyWeightsUpdateGroupRequest,
+    DistributedWeightsRequest,
+    InitWeightsUpdateGroupRequest,
+    RLRolloutRequest,
+    TensorWeightsRequest,
+)
 
 logger = init_logger(__name__)
 
@@ -280,10 +287,14 @@ async def generate_image(request: Request) -> Response:
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
 
+    await g_objs.httpserver_manager.begin_generation_session(request)
     try:
-        return await g_objs.g_generate_image_func(request, g_objs.httpserver_manager)
-    except Exception as e:
-        return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
+        try:
+            return await g_objs.g_generate_image_func(request, g_objs.httpserver_manager)
+        except Exception as e:
+            return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
+    finally:
+        await g_objs.httpserver_manager.end_generation_session(request)
 
 
 @app.post("/pause_generation")
@@ -298,6 +309,82 @@ async def continue_generation():
     return Response(content="Generation continued.", status_code=200)
 
 
+@app.get("/v1/rl/status")
+async def rl_status():
+    return g_objs.httpserver_manager.rl_status()
+
+
+@app.get("/get_weight_version")
+async def get_weight_version():
+    return {"weight_version": g_objs.httpserver_manager.rl_active_policy_version}
+
+
+@app.post("/init_weights_update_group")
+async def init_weights_update_group(request: InitWeightsUpdateGroupRequest):
+    try:
+        return await g_objs.httpserver_manager.init_weights_update_group(request.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/update_weights_from_distributed")
+async def update_weights_from_distributed(request: DistributedWeightsRequest):
+    try:
+        return await g_objs.httpserver_manager.update_weights_from_distributed(request.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/update_weights_from_tensor")
+async def update_weights_from_tensor(request: TensorWeightsRequest):
+    try:
+        return await g_objs.httpserver_manager.update_weights_from_tensor(request.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/destroy_weights_update_group")
+async def destroy_weights_update_group(request: DestroyWeightsUpdateGroupRequest):
+    try:
+        return await g_objs.httpserver_manager.destroy_weights_update_group(request.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/rl/rollouts")
+async def rl_rollouts(request: RLRolloutRequest, raw_request: Request):
+    from .api_rl import rl_rollouts as impl
+
+    await g_objs.httpserver_manager.begin_generation_session(raw_request)
+    try:
+        return await impl(request, raw_request, g_objs.httpserver_manager)
+    finally:
+        await g_objs.httpserver_manager.end_generation_session(raw_request)
+
+
+def _trace_path(bundle_id: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", bundle_id):
+        raise HTTPException(status_code=400, detail="invalid trace bundle id")
+    return os.path.join(os.getenv("MOVA_RL_TRACE_DIR", "/tmp/mova_rl_traces"), f"{bundle_id}.safetensors")
+
+
+@app.get("/v1/rl/traces/{bundle_id}")
+async def get_rl_trace(bundle_id: str):
+    path = _trace_path(bundle_id)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="trace bundle not found")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"{bundle_id}.safetensors")
+
+
+@app.delete("/v1/rl/traces/{bundle_id}")
+async def delete_rl_trace(bundle_id: str):
+    path = _trace_path(bundle_id)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="trace bundle not found")
+    os.unlink(path)
+    return {"deleted": bundle_id}
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def completions_v2(request: ChatCompletionRequestV2, raw_request: Request) -> Response:
     if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
@@ -305,7 +392,25 @@ async def completions_v2(request: ChatCompletionRequestV2, raw_request: Request)
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
 
-    resp = await chat_completions_impl_v2(request, raw_request)
+    await g_objs.httpserver_manager.begin_generation_session(raw_request)
+    try:
+        resp = await chat_completions_impl_v2(request, raw_request)
+    except BaseException:
+        await g_objs.httpserver_manager.end_generation_session(raw_request)
+        raise
+    if isinstance(resp, StreamingResponse):
+        body_iterator = resp.body_iterator
+
+        async def drain_session_after_stream():
+            try:
+                async for chunk in body_iterator:
+                    yield chunk
+            finally:
+                await g_objs.httpserver_manager.end_generation_session(raw_request)
+
+        resp.body_iterator = drain_session_after_stream()
+        return resp
+    await g_objs.httpserver_manager.end_generation_session(raw_request)
     return resp
 
 

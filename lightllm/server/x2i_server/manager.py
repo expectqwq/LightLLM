@@ -20,6 +20,8 @@ from lightllm.server.core.objs.x2i_params import X2IParams, X2IResponse, X2ICach
 from lightllm.utils.dist_utils import set_current_device_id
 from lightllm.utils.start_utils import start_submodule_processes
 from .past_kv_cache_client import PastKVCacheClient
+from lightllm.server.core.objs.io_objs import RLControlRequest, RLControlResponse
+from lightllm.utils.rl_weight_update import DistributedWeightReceiver
 
 logger = init_logger(__name__)
 
@@ -49,6 +51,10 @@ class X2IManager:
         # to http server
         self.send_to_httpserver = context.socket(zmq.PUSH)
         self.send_to_httpserver.connect(f"{args.zmq_mode}127.0.0.1:{args.http_server_port_for_x2i}")
+        self.send_rl_control_response = context.socket(zmq.PUSH)
+        self.send_rl_control_response.connect(
+            f"{args.zmq_mode}127.0.0.1:{args.rl_control_response_port}"
+        )
 
         self.use_naive_x2i = args.x2i_use_naive_impl
         self.world_size = args.x2i_server_used_gpus
@@ -83,6 +89,15 @@ class X2IManager:
                 self.gen_pipe.modify_config(
                     {"load_kv_cache_in_pipeline_for_debug": False, "save_result_for_debug": False}
                 )
+                from lightx2v.rl.trace_store import TraceStore
+
+                self.rl_trace_store = TraceStore(
+                    root=os.getenv("MOVA_RL_TRACE_DIR", "/tmp/mova_rl_traces"),
+                    ttl_seconds=int(os.getenv("MOVA_RL_TRACE_TTL", "3600")),
+                )
+                self.rl_weight_receiver = DistributedWeightReceiver(
+                    consumer="x2v", device=torch.device(f"cuda:{torch.cuda.current_device()}")
+                )
         else:
             # distribted x2v
             from lightllm.server.x2i_server.lightx2v.adapter import start_x2v_process
@@ -94,7 +109,7 @@ class X2IManager:
     async def t2i_generate(self, past_kv_cache, past_kv_cache_text, param: X2IParams):
         if self.use_naive_x2i:
             images = self.naive_x2i.t2i(past_kv_cache, past_kv_cache_text, param)
-            return images
+            return images, []
 
         self.gen_pipe.runner.set_inference_params(
             index_offset_cond=param.past_kvcache.get_compressed_len(),
@@ -105,20 +120,36 @@ class X2IManager:
             timestep_shift=param.timestep_shift,
         )
         images = []
+        trace_bundles = []
         for i in range(param.num_images):
             self.gen_pipe.runner.set_kvcache(past_kv_cache, past_kv_cache_text)
-            image = self.gen_pipe.generate(
-                seed=param.seed if param.first_image else None,
-                save_result_path="",  # 返回base64，不需要指定路径了
-                target_shape=[param.height, param.width],  # Height, Width
-            )
+            if hasattr(param, "rl_config"):
+                self.gen_pipe.runner.scheduler.infer_steps = param.steps
+                image, trace = self.gen_pipe.generate_rl(
+                    rl_config=param.rl_config,
+                    seed=param.seed if param.first_image else None,
+                    save_result_path="",
+                    target_shape=[param.height, param.width],
+                )
+                trace_bundles.append(
+                    self.rl_trace_store.put(
+                        trace,
+                        {"request_id": str(param.request_id), "image_index": str(i)},
+                    )
+                )
+            else:
+                image = self.gen_pipe.generate(
+                    seed=param.seed if param.first_image else None,
+                    save_result_path="",  # 返回base64，不需要指定路径了
+                    target_shape=[param.height, param.width],  # Height, Width
+                )
             images.append(image)
-        return images
+        return images, trace_bundles
 
     async def it2i_generate(self, past_kv_cache, past_kv_cache_text, past_kv_cache_img, param: X2IParams):
         if self.use_naive_x2i:
             images = self.naive_x2i.it2i(past_kv_cache, past_kv_cache_text, past_kv_cache_img, param)
-            return images
+            return images, []
 
         self.gen_pipe.runner.set_inference_params(
             index_offset_cond=param.past_kvcache.get_compressed_len(),
@@ -129,15 +160,31 @@ class X2IManager:
             timestep_shift=param.timestep_shift,
         )
         images = []
+        trace_bundles = []
         for i in range(param.num_images):
             self.gen_pipe.runner.set_kvcache_i2i(past_kv_cache, past_kv_cache_text, past_kv_cache_img)
-            image = self.gen_pipe.generate(
-                seed=param.seed + param.past_kvcache_img.img_len + i,
-                save_result_path="",  # 返回base64，不需要指定路径了
-                target_shape=[param.height, param.width],  # Height, Width
-            )
+            if hasattr(param, "rl_config"):
+                self.gen_pipe.runner.scheduler.infer_steps = param.steps
+                image, trace = self.gen_pipe.generate_rl(
+                    rl_config=param.rl_config,
+                    seed=param.seed + param.past_kvcache_img.img_len + i,
+                    save_result_path="",
+                    target_shape=[param.height, param.width],
+                )
+                trace_bundles.append(
+                    self.rl_trace_store.put(
+                        trace,
+                        {"request_id": str(param.request_id), "image_index": str(i)},
+                    )
+                )
+            else:
+                image = self.gen_pipe.generate(
+                    seed=param.seed + param.past_kvcache_img.img_len + i,
+                    save_result_path="",  # 返回base64，不需要指定路径了
+                    target_shape=[param.height, param.width],  # Height, Width
+                )
             images.append(image)
-        return images
+        return images, trace_bundles
 
     async def loop_for_fwd(self):
         while True:
@@ -175,18 +222,19 @@ class X2IManager:
                     )
 
                     images = []
+                    trace_bundles = []
                     logger.info(f"{'t2i' if is_t2i else 'it2i'} generate images with: {x2i_param}")
                     start_t = time.time()
                     if is_t2i:
-                        images = await self.t2i_generate(past_kv_cache, past_kv_cache_text, x2i_param)
+                        images, trace_bundles = await self.t2i_generate(past_kv_cache, past_kv_cache_text, x2i_param)
                     else:
-                        images = await self.it2i_generate(
+                        images, trace_bundles = await self.it2i_generate(
                             past_kv_cache, past_kv_cache_text, past_kv_cache_img, x2i_param
                         )
                     logger.info(f"generate {len(images)} images done, cost {time.time() - start_t:.2f}s")
 
                     self.send_to_httpserver.send_pyobj(
-                        X2IResponse(request_id=x2i_param.request_id, images=images), protocol=pickle.HIGHEST_PROTOCOL
+                        X2IResponse(request_id=x2i_param.request_id, images=images, trace_bundles=trace_bundles), protocol=pickle.HIGHEST_PROTOCOL
                     )
 
             except Exception as e:
@@ -198,13 +246,47 @@ class X2IManager:
     async def loop_for_netio_req(self):
         while True:
             try:
-                recv_req: X2IParams = self.zmq_recv_socket.recv_pyobj(zmq.NOBLOCK)
-                self.waiting_reqs.append(recv_req)
+                recv_req = self.zmq_recv_socket.recv_pyobj(zmq.NOBLOCK)
+                if isinstance(recv_req, RLControlRequest):
+                    await self.handle_rl_control(recv_req)
+                else:
+                    self.waiting_reqs.append(recv_req)
 
             except zmq.ZMQError:
                 await asyncio.sleep(0.1)
 
             await asyncio.sleep(0.01)
+
+    async def handle_rl_control(self, request: RLControlRequest):
+        try:
+            if self.world_size != 1 or self.use_naive_x2i:
+                raise RuntimeError("RL weight updates require one-GPU LightX2V separate mode")
+            payload = dict(request.payload)
+            payload["group_name"] = f"{payload.get('group_name', 'weight_update_group')}:x2v"
+            if request.operation == "init_weights_update_group":
+                payload["master_port"] = payload["master_ports"]["x2v"]
+                payload["world_size"] = payload["x2v_world_size"]
+                payload["rank_base"] = 1
+            if request.operation == "init_weights_update_group":
+                data = self.rl_weight_receiver.init_group(payload, rank=payload["rank_base"])
+                data["closure_names"] = sorted(self.gen_pipe.rl_weight_closure())
+            elif request.operation == "destroy_weights_update_group":
+                data = self.rl_weight_receiver.destroy_group(payload.get("group_name", "weight_update_group"))
+            elif request.operation == "update_weights_from_distributed":
+                tensors, data = self.rl_weight_receiver.receive(payload)
+                data["apply"] = self.gen_pipe.update_rl_weights(tensors, strict=False)
+                data["policy_version"] = payload["policy_version"]
+            elif request.operation == "update_weights_from_tensor":
+                tensors, data = self.rl_weight_receiver.decode_bundle(payload)
+                data["apply"] = self.gen_pipe.update_rl_weights(tensors, strict=False)
+                data["policy_version"] = payload["policy_version"]
+            else:
+                raise ValueError(f"unsupported X2V RL operation: {request.operation}")
+            response = RLControlResponse(request.op_id, "x2v", True, data=data)
+        except Exception as exc:
+            logger.exception("X2V RL control failed")
+            response = RLControlResponse(request.op_id, "x2v", False, message=str(exc))
+        self.send_rl_control_response.send_pyobj(response, protocol=pickle.HIGHEST_PROTOCOL)
 
     def clean_up(self):
         pass

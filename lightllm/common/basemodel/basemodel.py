@@ -193,6 +193,18 @@ class TpPartBaseModel:
         [weight.verify_load() for weight in self.trans_layers_weight]
         return
 
+    def load_weights(self, weight_dict):
+        """Apply an online checkpoint fragment using the normal HF mapping."""
+
+        load_hf_weights(
+            self.data_type,
+            weight_dir=self.weight_dir_,
+            pre_post_layer=self.pre_post_weight,
+            transformer_layer_list=self.trans_layers_weight,
+            weight_dict=weight_dict,
+        )
+        return
+
     def _init_mem_manager(self):
         assert self.config["num_attention_heads"] % self.tp_world_size_ == 0
         self.mem_manager: MemoryManager = select_mem_manager_class()(

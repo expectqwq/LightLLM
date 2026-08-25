@@ -128,6 +128,19 @@ class ModelRpcServer(rpyc.Service):
     def exposed_get_max_total_token_num(self):
         return self.backend.get_max_total_token_num()
 
+    def exposed_rl_control(self, operation, payload):
+        operation = obtain(operation)
+        payload = obtain(payload)
+        handlers = {
+            "init_weights_update_group": self.backend.init_rl_weight_group,
+            "update_weights_from_distributed": self.backend.update_rl_weights,
+            "update_weights_from_tensor": self.backend.update_rl_weights_from_tensor,
+            "destroy_weights_update_group": self.backend.destroy_rl_weight_group,
+        }
+        if operation not in handlers:
+            raise ValueError(f"unsupported language RL operation: {operation}")
+        return handlers[operation](payload)
+
 
 class ModelRpcClient:
     def __init__(self, conn):
@@ -151,6 +164,7 @@ class ModelRpcClient:
 
         self._init_model = async_wrap(self.conn.root.init_model)
         self._get_max_total_token_num = async_wrap(self.conn.root.get_max_total_token_num)
+        self._rl_control = async_wrap(self.conn.root.rl_control)
         return
 
     async def init_model(self, kvargs):
@@ -161,6 +175,9 @@ class ModelRpcClient:
     async def get_max_total_token_num(self):
         ans = self._get_max_total_token_num()
         return obtain(await ans)
+
+    async def rl_control(self, operation, payload):
+        return obtain(await self._rl_control(operation, payload))
 
 
 def _init_env(

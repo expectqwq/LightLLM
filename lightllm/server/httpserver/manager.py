@@ -1,4 +1,5 @@
 import sys
+import os
 import zmq
 import zmq.asyncio
 import asyncio
@@ -11,6 +12,7 @@ import hashlib
 import datetime
 import pickle
 import re
+import uuid
 from frozendict import frozendict
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -27,7 +29,7 @@ from lightllm.server.core.objs import Req, FinishStatus, StartArgs
 from lightllm.server.core.objs import SamplingParams
 from lightllm.server.core.objs.x2i_params import X2IParams, X2ICacheRelease, X2IResponse, PastKVCacheItem
 from lightllm.server.core.objs.out_token_circlequeue import LIGHTLLM_OUT_TOKEN_QUEUE_SIZE
-from lightllm.server.core.objs.io_objs import GroupReqObjs
+from lightllm.server.core.objs.io_objs import GroupReqObjs, RLControlRequest, RLControlResponse
 from lightllm.server.core.objs.shm_req_manager import ShmReqManager
 from lightllm.server.core.objs.atomic_array_lock import AtomicShmArrayLock, AsyncLock, AtomicLockItem
 from lightllm.server.router.dynamic_prompt.shared_arr import SharedInt
@@ -136,6 +138,22 @@ class HttpServerManager:
         self.latest_success_infer_time_mark.set_value(int(time.time()))
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        # A session spans a complete public request, not merely one LightLLM
+        # text span.  This matters for TI2TI, where the same HTTP request can
+        # enter text -> image -> text several times.  Weight publication stops
+        # admission and drains these sessions before touching any consumer.
+        self.generation_session_count = 0
+        self.recv_rl_control_response = context.socket(zmq.PULL)
+        self.recv_rl_control_response.bind(
+            f"{args.zmq_mode}127.0.0.1:{args.rl_control_response_port}"
+        )
+        self.rl_control_waiters = {}
+        self.rl_control_lock = asyncio.Lock()
+        self.rl_active_policy_version = "startup"
+        self.rl_pending_policy_version = None
+        self.rl_update_id = None
+        self.rl_last_receipts = {}
+        self.rl_last_error = None
         return
 
     def _log_stage_timing(self, group_request_id: int, start_time: float, stage: str, **kwargs):
@@ -326,8 +344,13 @@ class HttpServerManager:
         )
 
         try:
-            async with self.is_pause_cond:
-                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            admitted_session = bool(
+                request is not None
+                and getattr(getattr(request, "state", None), "mova_generation_admitted", False)
+            )
+            if not admitted_session:
+                async with self.is_pause_cond:
+                    await self.is_pause_cond.wait_for(lambda: not self.is_pause)
             original_multimodal_params = None
             if self.is_multinode_tp_master:
                 original_multimodal_params = copy.deepcopy(multimodal_params)
@@ -494,6 +517,7 @@ class HttpServerManager:
         multimodal_params: MultimodalParams,
         request: Request,
         input_image_num: int = 0,
+        return_response: bool = False,
     ):
         generate_req_ids = []
 
@@ -569,7 +593,7 @@ class HttpServerManager:
             self.req_id_to_x2i_reqs.pop(x2i_req_id, None)
             generation_params.first_image = False
 
-            return req_status.response.images
+            return req_status.response if return_response else req_status.response.images
 
         except Exception as e:
             logger.error(str(e), exc_info=e)
@@ -872,13 +896,35 @@ class HttpServerManager:
         logger.warning(f"aborted group_request_id {group_req_objs.group_req_id}")
         return True
 
+    async def begin_generation_session(self, request: Request):
+        """Admit one complete public generation trajectory.
+
+        Marking the request lets its later image-prefill/text-resume phases
+        pass the low-level admission gate after a pause has started.  They are
+        already counted as in-flight and must drain instead of deadlocking.
+        """
+
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            self.generation_session_count += 1
+            request.state.mova_generation_admitted = True
+
+    async def end_generation_session(self, request: Request):
+        async with self.is_pause_cond:
+            if not getattr(request.state, "mova_generation_admitted", False):
+                return
+            request.state.mova_generation_admitted = False
+            self.generation_session_count -= 1
+            if self.generation_session_count < 0:
+                raise RuntimeError("generation session counter underflow")
+            self.is_pause_cond.notify_all()
+
     async def pause_generation(self):
-        """Stop admission and drain both text and image work."""
+        """Stop new admission and let complete text/image trajectories drain."""
 
         async with self.is_pause_cond:
             self.is_pause = True
-        for group_req_id in list(self.req_id_to_out_inf):
-            await self.abort(group_req_id)
+            await self.is_pause_cond.wait_for(lambda: self.generation_session_count == 0)
         while self.req_id_to_out_inf or (
             self.args.enable_multimodal_x2i and self.req_id_to_x2i_reqs
         ):
@@ -888,6 +934,137 @@ class HttpServerManager:
         async with self.is_pause_cond:
             self.is_pause = False
             self.is_pause_cond.notify_all()
+
+    def rl_status(self):
+        return {
+            "paused": self.is_pause,
+            "inflight_generation_sessions": self.generation_session_count,
+            "active_policy_version": self.rl_active_policy_version,
+            "pending_policy_version": self.rl_pending_policy_version,
+            "update_id": self.rl_update_id,
+            "last_receipts": self.rl_last_receipts,
+            "last_error": self.rl_last_error,
+            "consumers": ["language", "vision", "x2v"],
+            "provenance": {
+                "lightllm_commit": os.getenv("MOVA_LIGHTLLM_COMMIT", "unknown"),
+                "lightx2v_commit": os.getenv("MOVA_LIGHTX2V_COMMIT", "unknown"),
+                "sensenova_commit": os.getenv("MOVA_SENSENOVA_COMMIT", "unknown"),
+                "image_digest": os.getenv("MOVA_IMAGE_DIGEST", "unknown"),
+            },
+        }
+
+    async def _dispatch_rl_control(self, operation, payload, timeout=1800.0):
+        expected = {"language", "vision", "x2v"}
+        if self.args.disable_vision or not self.args.enable_multimodal_x2i:
+            raise RuntimeError("RL engine requires language, vision and LightX2V consumers")
+        op_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.rl_control_waiters[op_id] = {
+            "future": future,
+            "expected": expected,
+            "responses": {},
+        }
+        request = RLControlRequest(op_id=op_id, operation=operation, payload=payload)
+        await self.send_to_router.send_pyobj(request, protocol=pickle.HIGHEST_PROTOCOL)
+        await self.send_to_visual.send_pyobj(request, protocol=pickle.HIGHEST_PROTOCOL)
+        await self.send_to_x2i.send_pyobj(request, protocol=pickle.HIGHEST_PROTOCOL)
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self.rl_control_waiters.pop(op_id, None)
+
+    async def init_weights_update_group(self, payload):
+        async with self.rl_control_lock:
+            await self.pause_generation()
+            self.rl_update_id = uuid.uuid4().hex
+            payload = dict(payload)
+            payload.update(
+                {
+                    "language_world_size": 1 + self.args.tp,
+                    "vision_world_size": 1 + self.args.visual_dp * self.args.visual_tp,
+                    "x2v_world_size": 2,
+                }
+            )
+            if payload.get("master_ports") is None:
+                base_port = int(payload["master_port"])
+                payload["master_ports"] = {
+                    "language": base_port,
+                    "vision": base_port + 1,
+                    "x2v": base_port + 2,
+                }
+            expected_world = 1 + self.args.tp + self.args.visual_dp * self.args.visual_tp + 1
+            if int(payload["world_size"]) != expected_world:
+                raise ValueError(f"weight publisher world_size must be {expected_world}")
+            receipts = await self._dispatch_rl_control("init_weights_update_group", payload)
+            self.rl_last_receipts = receipts
+            self.rl_last_error = None
+            return {"update_id": self.rl_update_id, "receipts": receipts}
+
+    async def update_weights_from_distributed(self, payload):
+        async with self.rl_control_lock:
+            if not self.is_pause or self.rl_update_id is None:
+                raise RuntimeError("initialize a paused weight update before publishing tensors")
+            pending = str(payload["policy_version"])
+            if not pending or pending == self.rl_active_policy_version:
+                raise ValueError("policy_version must be a new non-empty version")
+            self.rl_pending_policy_version = pending
+            try:
+                receipts = await self._dispatch_rl_control("update_weights_from_distributed", dict(payload))
+                self.rl_active_policy_version = pending
+                self.rl_pending_policy_version = None
+                self.rl_last_receipts = receipts
+                self.rl_last_error = None
+                await self.continue_generation()
+                return {"policy_version": pending, "receipts": receipts}
+            except Exception as exc:
+                self.rl_last_error = str(exc)
+                # Deliberately remain paused: a consumer may already have copied
+                # some buckets and a half-updated policy must never serve rollout.
+                raise
+
+    async def update_weights_from_tensor(self, payload):
+        async with self.rl_control_lock:
+            if not self.is_pause or self.rl_update_id is None:
+                raise RuntimeError("initialize a paused weight update before publishing tensors")
+            pending = str(payload["policy_version"])
+            if not pending or pending == self.rl_active_policy_version:
+                raise ValueError("policy_version must be a new non-empty version")
+            self.rl_pending_policy_version = pending
+            try:
+                receipts = await self._dispatch_rl_control("update_weights_from_tensor", dict(payload))
+                self.rl_active_policy_version = pending
+                self.rl_pending_policy_version = None
+                self.rl_last_receipts = receipts
+                self.rl_last_error = None
+                await self.continue_generation()
+                return {"policy_version": pending, "receipts": receipts}
+            except Exception as exc:
+                self.rl_last_error = str(exc)
+                raise
+
+    async def destroy_weights_update_group(self, payload):
+        async with self.rl_control_lock:
+            receipts = await self._dispatch_rl_control("destroy_weights_update_group", dict(payload))
+            self.rl_update_id = None
+            return {"receipts": receipts}
+
+    async def loop_for_rl_control(self):
+        while True:
+            response: RLControlResponse = await self.recv_rl_control_response.recv_pyobj()
+            waiter = self.rl_control_waiters.get(response.op_id)
+            if waiter is None:
+                logger.warning(f"late RL control response {response.op_id} from {response.consumer}")
+                continue
+            waiter["responses"][response.consumer] = response
+            if waiter["expected"] <= set(waiter["responses"]):
+                failures = [item for item in waiter["responses"].values() if not item.success]
+                if failures:
+                    message = "; ".join(f"{item.consumer}: {item.message}" for item in failures)
+                    waiter["future"].set_exception(RuntimeError(message))
+                else:
+                    waiter["future"].set_result(
+                        {name: item.data for name, item in waiter["responses"].items()}
+                    )
 
     async def recycle_resource_loop(self):
         pre_time_mark = time.time()
@@ -984,6 +1161,7 @@ class HttpServerManager:
 
         if self.args.enable_multimodal_x2i:
             asyncio.create_task(self.loop_for_x2i())
+        asyncio.create_task(self.loop_for_rl_control())
 
         while True:
             try:

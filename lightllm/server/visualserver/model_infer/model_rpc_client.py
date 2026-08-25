@@ -23,6 +23,7 @@ class VisualModelRpcClient:
 
         self._init_model = async_wrap(self.rpc_conn.root.init_model)
         self._run_task = async_wrap(self.rpc_conn.root.run_task)
+        self._rl_control = async_wrap(self.rpc_conn.root.rl_control)
 
         return
 
@@ -34,3 +35,6 @@ class VisualModelRpcClient:
     async def run_task(self, images: List[ImageItem], ref_event_list: List[threading.Event]):
         ans = self._run_task(images, ref_event_list)
         return await ans
+
+    async def rl_control(self, operation, payload):
+        return await self._rl_control(operation, payload)

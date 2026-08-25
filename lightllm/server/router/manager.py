@@ -20,6 +20,8 @@ from lightllm.server.core.objs.io_objs import (
     GroupReqIndexes,
     AbortedReqCmd,
     StopStrMatchedReqCmd,
+    RLControlRequest,
+    RLControlResponse,
 )
 from lightllm.server.core.objs import ShmReqManager, StartArgs
 from .dynamic_prompt.radix_cache import RadixCacheReadOnlyClient
@@ -82,6 +84,10 @@ class RouterManager:
 
         self.send_to_detokenization = context.socket(zmq.PUSH)
         self.send_to_detokenization.connect(f"{args.zmq_mode}127.0.0.1:{args.detokenization_port}")
+        self.send_rl_control_response = context.socket(zmq.PUSH)
+        self.send_rl_control_response.connect(
+            f"{args.zmq_mode}127.0.0.1:{args.rl_control_response_port}"
+        )
 
         if self.is_multinode_tp:
             self.mulitnode_group = dist.init_process_group(
@@ -511,9 +517,11 @@ class RouterManager:
         try:
             # 一次最多从 zmq 中取 recv_max_count 个请求，防止 zmq 队列中请求数量过多导致阻塞了主循环。
             for _ in range(self.recv_max_count):
-                recv_req: GroupReqIndexes = self.zmq_recv_socket.recv_pyobj(zmq.NOBLOCK)
+                recv_req = self.zmq_recv_socket.recv_pyobj(zmq.NOBLOCK)
                 if isinstance(recv_req, GroupReqIndexes):
                     self._add_req(recv_req)
+                elif isinstance(recv_req, RLControlRequest):
+                    await self._handle_rl_control(recv_req)
                 else:
                     assert False, f"Error Req Inf {recv_req}"
 
@@ -530,6 +538,27 @@ class RouterManager:
             if self._get_paused_req_num() == 0:
                 self._generate_new_batch()
         return
+
+    async def _handle_rl_control(self, request: RLControlRequest):
+        try:
+            results = await asyncio.gather(
+                *(client.rl_control(request.operation, request.payload) for client in self.model_rpc_clients)
+            )
+            response = RLControlResponse(
+                op_id=request.op_id,
+                consumer="language",
+                success=True,
+                data={"ranks": results},
+            )
+        except Exception as exc:
+            logger.exception("language RL control failed")
+            response = RLControlResponse(
+                op_id=request.op_id,
+                consumer="language",
+                success=False,
+                message=str(exc),
+            )
+        self.send_rl_control_response.send_pyobj(response, protocol=pickle.HIGHEST_PROTOCOL)
 
     def clean_up(self):
         return

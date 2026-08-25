@@ -3,6 +3,60 @@ import os
 import torch
 import requests
 
+
+def init_custom_process_group(
+    backend=None,
+    init_method=None,
+    timeout=None,
+    world_size=-1,
+    rank=-1,
+    store=None,
+    group_name=None,
+    pg_options=None,
+    device_id=None,
+):
+    """Create a non-default process group for online weight publication.
+
+    Narrowly ported from upstream LightLLM RL support.  Keeping this group
+    independent prevents a publisher from disturbing the serving TP group.
+    """
+
+    from torch.distributed.distributed_c10d import (
+        Backend,
+        PrefixStore,
+        _new_process_group_helper,
+        _world,
+        default_pg_timeout,
+        rendezvous,
+    )
+
+    assert store is None or init_method is None
+    if store is not None:
+        assert world_size > 0 and rank >= 0
+    elif init_method is None:
+        init_method = "env://"
+    backend = Backend(backend or "undefined")
+    timeout = default_pg_timeout if timeout is None else timeout
+    if store is None:
+        iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        store, rank, world_size = next(iterator)
+        store.set_timeout(timeout)
+        store = PrefixStore(group_name, store)
+    option_name = "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+    pg, _ = _new_process_group_helper(
+        world_size,
+        rank,
+        [],
+        backend,
+        store,
+        group_name=group_name,
+        **{option_name: pg_options},
+        timeout=timeout,
+        device_id=device_id,
+    )
+    _world.pg_group_ranks[pg] = {index: index for index in range(world_size)}
+    return pg
+
 # 规范 rank 的含义，在 llm 推理的相关代码中下述的 rank 的含义如下：
 # global_rank 全局 rank 序列id， 如两节点 8卡，会存在 0 - 15 16个global_rank
 # global_world_size 全局的 world size 大小， 如两节点 8 卡，该值为 16

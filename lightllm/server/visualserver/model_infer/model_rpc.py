@@ -28,6 +28,7 @@ from lightllm.server.embed_cache.embed_cache_client import CpuEmbedCacheClient
 from lightllm.server.visualserver import set_vit_att_backend
 from lightllm.server.embed_cache.afs_utils import SepEmbedHandler
 from lightllm.utils.log_utils import init_logger
+from lightllm.utils.rl_weight_update import DistributedWeightReceiver
 
 
 logger = init_logger(__name__)
@@ -114,6 +115,9 @@ class VisualModelRpcServer(rpyc.Service):
 
             self.model.load_model(weight_dir)
             self.model = self.model.cuda()
+            self.rl_weight_receiver = DistributedWeightReceiver(
+                consumer="vision", device=torch.device(f"cuda:{self.device_id}")
+            )
             if not self.is_visual_only_mode:
                 self.cache_client = rpyc.connect("localhost", self.cache_port, config={"allow_pickle": True})
                 self.cache_client._channel.stream.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -142,6 +146,32 @@ class VisualModelRpcServer(rpyc.Service):
 
         set_random_seed(2147483647)
         return
+
+    def exposed_rl_control(self, operation, payload):
+        operation = obtain(operation)
+        payload = obtain(payload)
+        rank = int(payload.get("rank_base", 0)) + self.dp_rank_id * self.vit_tp + self.tp_rank_id
+        if operation == "init_weights_update_group":
+            receipt = self.rl_weight_receiver.init_group(payload, rank=rank)
+            prefix = "vision_model.embeddings."
+            receipt["closure_names"] = [prefix + name for name in sorted(self.model.state_dict())]
+            return receipt
+        if operation == "destroy_weights_update_group":
+            return self.rl_weight_receiver.destroy_group(payload.get("group_name", "weight_update_group"))
+        if operation not in {"update_weights_from_distributed", "update_weights_from_tensor"}:
+            raise ValueError(f"unsupported vision RL operation: {operation}")
+        if operation == "update_weights_from_distributed":
+            tensors, receipt = self.rl_weight_receiver.receive(payload)
+        else:
+            tensors, receipt = self.rl_weight_receiver.decode_bundle(payload)
+        prefix = "vision_model.embeddings."
+        mapped = {name[len(prefix) :]: tensor for name, tensor in tensors.items() if name.startswith(prefix)}
+        result = self.model.load_state_dict(mapped, strict=False)
+        if result.unexpected_keys:
+            raise ValueError(f"unexpected vision tensors: {result.unexpected_keys[:5]}")
+        receipt["missing_model_keys"] = list(result.missing_keys)
+        receipt["policy_version"] = payload["policy_version"]
+        return receipt
 
     def exposed_run_task(self, images: List["ImageItem"], ref_event_list: List[threading.Event]):
         try:

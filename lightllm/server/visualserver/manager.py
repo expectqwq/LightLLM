@@ -11,6 +11,7 @@ import threading
 import collections
 from typing import List
 from lightllm.server.core.objs.io_objs.group_req import GroupReqIndexes
+from lightllm.server.core.objs.io_objs import RLControlRequest, RLControlResponse
 from lightllm.server.core.objs import ShmReqManager, StartArgs
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -58,6 +59,10 @@ class VisualManager:
         self.send_batch_size = args.visual_send_batch_size
         self.shm_req_manager = ShmReqManager()
         self.lock = asyncio.Lock()
+        self.send_rl_control_response = context.socket(zmq.PUSH)
+        self.send_rl_control_response.connect(
+            f"{args.zmq_mode}127.0.0.1:{args.rl_control_response_port}"
+        )
 
     async def wait_to_model_ready(self):
 
@@ -181,10 +186,33 @@ class VisualManager:
                         f"img count {len(recv_req.multimodal_params.images)}"
                     )
                     asyncio.create_task(self.handle_group_indexes(group_req_indexes=recv_req))
+                elif isinstance(recv_req, RLControlRequest):
+                    await self.handle_rl_control(recv_req)
                 else:
                     assert False, f"Error Req Inf {recv_req}"
         except Exception as e:
             logger.exception(str(e))
+
+    async def handle_rl_control(self, request: RLControlRequest):
+        try:
+            payload = dict(request.payload)
+            payload["group_name"] = f"{payload.get('group_name', 'weight_update_group')}:vision"
+            if request.operation == "init_weights_update_group":
+                payload["master_port"] = payload["master_ports"]["vision"]
+                payload["world_size"] = payload["vision_world_size"]
+                payload["rank_base"] = 1
+            results = await asyncio.gather(
+                *(
+                    rpc.rl_control(request.operation, payload)
+                    for replicas in self.model_rpcs
+                    for rpc in replicas
+                )
+            )
+            response = RLControlResponse(request.op_id, "vision", True, data={"ranks": results})
+        except Exception as exc:
+            logger.exception("vision RL control failed")
+            response = RLControlResponse(request.op_id, "vision", False, message=str(exc))
+        self.send_rl_control_response.send_pyobj(response, protocol=pickle.HIGHEST_PROTOCOL)
 
     def clean_up(self):
         return

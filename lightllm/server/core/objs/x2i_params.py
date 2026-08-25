@@ -159,6 +159,7 @@ class X2IParams(ctypes.Structure):
 class X2IResponse:
     request_id: int
     images: Optional[List[bytes]]
+    trace_bundles: Optional[List[str]] = None
 
 
 @dataclass
