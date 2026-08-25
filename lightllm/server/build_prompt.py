@@ -63,11 +63,40 @@ def _normalize_tool_call_arguments(messages: list) -> None:
                             pass
 
 
+def _flatten_multimodal_content(messages: list) -> None:
+    """Convert OpenAI content parts to the string format used by HF templates.
+
+    Image/audio payloads are extracted separately by ``_get_images_and_audios``.
+    Their placeholders must remain in the same order as the content parts so
+    multimodal token injection stays aligned with those payloads.
+    """
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            content_type = item.get("type")
+            if content_type == "text":
+                text = item.get("text")
+                if text:
+                    parts.append(text)
+            elif content_type == "image_url":
+                parts.append("<image>")
+            elif content_type == "audio_url":
+                parts.append("<audio>")
+        msg["content"] = "\n".join(parts)
+
+
 async def build_prompt(request, tools) -> str:
     global tokenizer
     # pydantic格式转成dict， 否则，当根据tokenizer_config.json拼template时，Jinja判断无法识别
     messages = [m.model_dump(by_alias=True, exclude_none=True) for m in request.messages]
     _normalize_tool_call_arguments(messages)
+    _flatten_multimodal_content(messages)
 
     kwargs = {"conversation": messages}
     if request.character_settings:

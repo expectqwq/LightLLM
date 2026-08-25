@@ -87,6 +87,11 @@ def test_case4():
     tree.print_self()
 
     tree.clear_tree_nodes()
+    tree.clear_tree_nodes()
+    assert list(tree.evict_tree_set) == [tree.root_node]
+    assert tree.root_node.children == {}
+    assert tree.get_tree_total_tokens_num() == 0
+    assert tree.get_refed_tokens_num() == 0
     print(ans)
     return
 

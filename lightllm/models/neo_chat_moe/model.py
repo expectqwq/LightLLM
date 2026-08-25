@@ -139,10 +139,21 @@ class NeoChatTokenizer(BaseMultiModalTokenizer):
         return input_ids
 
     def _build_t2i_query(self, msg, thinking_content=""):
-        template = self.conversation_module.get_conv_template(self.template)
-        template.append_message(template.roles[0], msg)
-        template.append_message(template.roles[1], None)
-        return template.get_prompt() + thinking_content + IMG_START_TOKEN
+        if self.conversation_module is not None:
+            template = self.conversation_module.get_conv_template(self.template)
+            template.append_message(template.roles[0], msg)
+            template.append_message(template.roles[1], None)
+            prompt = template.get_prompt()
+        else:
+            # Public U1.5 checkpoints ship the tokenizer chat template but not
+            # the legacy ``conversation.py`` helper. Use that same official
+            # template for unconditional image-generation prefixes.
+            prompt = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": msg}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        return prompt + thinking_content + IMG_START_TOKEN
 
     def fix_prompt(self, prompt: str, img_len: int):
         prompt_img_len = prompt.count(IMG_TOKEN)

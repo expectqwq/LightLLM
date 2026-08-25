@@ -24,7 +24,7 @@ _DTYPES = {
 
 
 def tensor_checksum(tensor: torch.Tensor) -> str:
-    raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    raw = tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -105,12 +105,17 @@ class DistributedWeightReceiver:
         transport_device = self.device if backend == "nccl" else torch.device("cpu")
         selected = {}
         received = {}
+        received_bucket_count = 0
         for bucket in payload["buckets"]:
+            consumers = bucket.get("consumers")
+            if consumers and self.consumer not in consumers:
+                continue
             dtype_name = bucket["dtype"]
             if dtype_name not in _DTYPES:
                 raise ValueError(f"unsupported tensor dtype {dtype_name}")
             flat = torch.empty(int(bucket["numel"]), dtype=_DTYPES[dtype_name], device=transport_device)
             dist.broadcast(flat, src=0, group=group)
+            received_bucket_count += 1
             if tensor_checksum(flat) != bucket["checksum"]:
                 raise ValueError(f"bucket checksum mismatch for {bucket['id']}")
             offset = 0
@@ -139,7 +144,7 @@ class DistributedWeightReceiver:
             "received_names": sorted(received),
             "checksums": received,
             "closure_size": len(required),
-            "bucket_count": len(payload["buckets"]),
+            "bucket_count": received_bucket_count,
         }
 
     def decode_bundle(self, payload: dict) -> tuple[dict[str, torch.Tensor], dict]:

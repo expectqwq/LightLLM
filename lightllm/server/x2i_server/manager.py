@@ -269,7 +269,9 @@ class X2IManager:
                 payload["rank_base"] = 1
             if request.operation == "init_weights_update_group":
                 data = self.rl_weight_receiver.init_group(payload, rank=payload["rank_base"])
-                data["closure_names"] = sorted(self.gen_pipe.rl_weight_closure())
+                closure = self.gen_pipe.rl_weight_closure()
+                data["closure_names"] = sorted(closure)
+                data["closure_specs"] = closure
             elif request.operation == "destroy_weights_update_group":
                 data = self.rl_weight_receiver.destroy_group(payload.get("group_name", "weight_update_group"))
             elif request.operation == "update_weights_from_distributed":

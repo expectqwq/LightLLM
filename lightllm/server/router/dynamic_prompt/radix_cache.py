@@ -422,7 +422,7 @@ class RadixCache:
         """
         该函数只在测试时调用
         """
-        while True:
+        while self.evict_tree_set:
             node: TreeNode = self.evict_tree_set.pop(0)
             if node != self.root_node:
                 parent_node: TreeNode = node.parent
@@ -432,6 +432,11 @@ class RadixCache:
             else:
                 break
 
+        # Keep the empty-tree sentinel invariant so repeated policy updates
+        # can invalidate the radix cache safely.  The old implementation
+        # popped the root permanently and the second clear raised IndexError.
+        self.evict_tree_set.clear()
+        self.evict_tree_set.add(self.root_node)
         self.tree_total_tokens_num.arr[0] = 0
         self.refed_tokens_num.arr[0] = 0
         return

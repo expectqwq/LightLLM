@@ -154,7 +154,15 @@ class VisualModelRpcServer(rpyc.Service):
         if operation == "init_weights_update_group":
             receipt = self.rl_weight_receiver.init_group(payload, rank=rank)
             prefix = "vision_model.embeddings."
-            receipt["closure_names"] = [prefix + name for name in sorted(self.model.state_dict())]
+            state = self.model.state_dict()
+            receipt["closure_names"] = [prefix + name for name in sorted(state)]
+            receipt["closure_specs"] = {
+                prefix + name: {
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                }
+                for name, tensor in state.items()
+            }
             return receipt
         if operation == "destroy_weights_update_group":
             return self.rl_weight_receiver.destroy_group(payload.get("group_name", "weight_update_group"))
