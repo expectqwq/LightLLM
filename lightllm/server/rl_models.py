@@ -1,3 +1,4 @@
+import math
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -61,6 +62,28 @@ class ImagePolicyConfig(BaseModel):
     sde_window_end: int | None = Field(default=None, gt=0)
     sde_selected_steps: int | None = Field(default=None, gt=0)
     sde_indices: list[int] | None = None
+
+    @model_validator(mode="after")
+    def validate_image_geometry(self):
+        if (self.height is None) != (self.width is None):
+            raise ValueError("height and width must be provided together")
+        if self.height is not None and self.image_size is not None:
+            raise ValueError("manual height/width and image_size are mutually exclusive")
+        if not math.isfinite(self.timestep_shift) or self.timestep_shift <= 0:
+            raise ValueError("timestep_shift must be a positive finite value")
+        if not math.isfinite(self.t_eps) or not 0 < self.t_eps < 1:
+            raise ValueError("t_eps must lie inside (0, 1)")
+        end = self.image_steps if self.sde_window_end is None else self.sde_window_end
+        if not self.sde_window_start < end <= self.image_steps:
+            raise ValueError("SDE window must be a non-empty subset of image steps")
+        if self.sde_selected_steps is not None and self.sde_selected_steps > end - self.sde_window_start:
+            raise ValueError("sde_selected_steps exceeds its window")
+        if self.sde_indices is not None:
+            if not self.sde_indices or len(self.sde_indices) != len(set(self.sde_indices)):
+                raise ValueError("sde_indices must contain distinct steps")
+            if min(self.sde_indices) < 0 or max(self.sde_indices) >= self.image_steps:
+                raise ValueError("sde_indices contains an out-of-range step")
+        return self
 
 
 class RLRolloutRequest(BaseModel):
