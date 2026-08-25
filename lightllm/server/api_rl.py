@@ -43,6 +43,7 @@ def _image_config(policy, seed: int) -> ImageConfig:
 def _sde_config(policy) -> dict[str, Any]:
     values = {
         "noise_level": policy.image_noise_level,
+        "t_eps": policy.t_eps,
         "window_start": policy.sde_window_start,
         "window_end": policy.sde_window_end,
         "selected_steps": policy.sde_selected_steps,
