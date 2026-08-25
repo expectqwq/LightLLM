@@ -76,6 +76,7 @@ async def _one_rollout(
     chat_request = ChatCompletionRequest(**chat_v2.model_dump())
     images, audios = _get_images_and_audios(chat_request)
     multimodal = MultimodalParams(images=images, audios=audios)
+    input_image_num = len(multimodal.images)
     prompt = await build_prompt(chat_request, tools=None)
 
     image_start_tag = manager.tokenizer.image_start_tag
@@ -160,7 +161,7 @@ async def _one_rollout(
             x2i_params,
             multimodal.clone(),
             request=raw_request,
-            input_image_num=len(multimodal.images),
+            input_image_num=input_image_num,
             return_response=True,
         )
         if not isinstance(x2i_response, X2IResponse) or not x2i_response.images:
