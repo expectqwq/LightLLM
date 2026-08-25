@@ -39,7 +39,6 @@ class X2IParams(ctypes.Structure):
         ("cfg_interval", ctypes.c_float * 2),
         ("timestep_shift", ctypes.c_float),
         ("cfg_norm", ctypes.c_int),
-        ("timestep_shift", ctypes.c_float),
         ("past_kvcache", PastKVCachePageList),
         ("past_kvcache_text", PastKVCachePageList),
         ("past_kvcache_img", PastKVCachePageList),
@@ -97,6 +96,10 @@ class X2IParams(ctypes.Structure):
             kwargs["guidance_scale"] = image_config.guidance_scale
         if image_config.image_guidance_scale is not None:
             kwargs["image_guidance_scale"] = image_config.image_guidance_scale
+        if image_config.cfg_interval is not None:
+            kwargs["cfg_interval"] = image_config.cfg_interval
+        if image_config.timestep_shift is not None:
+            kwargs["timestep_shift"] = image_config.timestep_shift
         if image_config.seed is not None:
             kwargs["seed"] = image_config.seed
         if image_config.num_images is not None:

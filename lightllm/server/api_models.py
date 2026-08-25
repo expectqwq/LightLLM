@@ -417,6 +417,8 @@ class ImageConfig(BaseModel):
     steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     image_guidance_scale: Optional[float] = None
+    cfg_interval: Optional[tuple[float, float]] = None
+    timestep_shift: Optional[float] = None
     seed: Optional[int] = None
     num_images: Optional[int] = None
     cfg_norm: Optional[Literal["none", "cfg_zero_star", "global", "text_channel", "channel"]] = None
@@ -479,11 +481,28 @@ class ImageConfig(BaseModel):
         print(f"self.height: {self.height}, self.width: {self.width}", flush=True)
         if self.height > -1 and self.width > -1:
             w, h = self.width, self.height
+            # Explicit custom geometry is a request contract, not a hint.  In
+            # particular MOSTAR evaluates the U1.5 pixel head at 512x512; the
+            # generic image API's 1M-pixel default used to silently turn that
+            # into 1024x1024.  Keep only the factor-of-32 normalization here.
+            pixels = h * w
+            h, w = smart_resize(
+                h,
+                w,
+                factor=32,
+                min_pixels=pixels,
+                max_pixels=pixels,
+            )
         else:
             base = self._aspect_ratio_to_resolution[self.aspect_ratio][self.image_size]
             w, h = base
-
-        h, w = smart_resize(h, w, factor=32, min_pixels=1024 * 1024, max_pixels=2048 * 2048)
+            h, w = smart_resize(
+                h,
+                w,
+                factor=32,
+                min_pixels=1024 * 1024,
+                max_pixels=2048 * 2048,
+            )
         return w, h
 
 
