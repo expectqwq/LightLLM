@@ -24,6 +24,7 @@ class DistributedWeightsRequest(BaseModel):
     policy_version: str
     group_name: str = "weight_update_group"
     buckets: list[dict] | None = None
+    full_update: bool = True
 
     @model_validator(mode="after")
     def validate_columns(self):
@@ -45,6 +46,7 @@ class TensorWeightsRequest(BaseModel):
     assignments: dict[str, list[Literal["language", "vision", "x2v"]]] = Field(default_factory=dict)
     required: dict[str, list[str]] = Field(default_factory=dict)
     policy_version: str
+    full_update: bool = False
 
 
 class ImagePolicyConfig(BaseModel):

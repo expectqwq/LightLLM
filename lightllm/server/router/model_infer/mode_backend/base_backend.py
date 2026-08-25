@@ -4,6 +4,7 @@ import torch
 import time
 import threading
 import torch.distributed as dist
+from safetensors import safe_open
 from typing import List, Tuple, Callable, Optional
 from transformers.configuration_utils import PretrainedConfig
 from lightllm.utils.infer_utils import set_random_seed
@@ -178,6 +179,7 @@ class ModeBackend:
         self.rl_weight_receiver = DistributedWeightReceiver(
             consumer="language", device=torch.device(f"cuda:{get_current_device_id()}")
         )
+        self.rl_language_weight_names = self._load_language_weight_closure()
         set_random_seed(2147483647)
 
         radix_cache_class = self.model.radix_cache_class
@@ -291,12 +293,41 @@ class ModeBackend:
         payload["master_port"] = payload["master_ports"]["language"]
         payload["world_size"] = payload["language_world_size"]
         payload["group_name"] = f"{payload.get('group_name', 'weight_update_group')}:language"
-        return self.rl_weight_receiver.init_group(payload, rank=1 + self.global_rank)
+        receipt = self.rl_weight_receiver.init_group(payload, rank=1 + self.global_rank)
+        receipt["closure_names"] = sorted(self.rl_language_weight_names)
+        return receipt
+
+    def _load_language_weight_closure(self):
+        """Return the HF checkpoint tensors consumed by the language runner."""
+
+        names = set()
+        for filename in os.listdir(self.weight_dir):
+            if not filename.endswith(".safetensors"):
+                continue
+            with safe_open(os.path.join(self.weight_dir, filename), framework="pt", device="cpu") as handle:
+                for name in handle.keys():
+                    if name.startswith("vision_model.") or "fm_modules" in name or "mot_gen" in name:
+                        continue
+                    names.add(name)
+        if not names:
+            raise RuntimeError("cannot establish language closure from a non-safetensors checkpoint")
+        return names
+
+    def _verify_language_closure(self, tensors, payload):
+        if not payload.get("full_update", False):
+            return
+        missing = sorted(self.rl_language_weight_names - set(tensors))
+        unexpected = sorted(set(tensors) - self.rl_language_weight_names)
+        if missing or unexpected:
+            raise ValueError(
+                f"language parameter closure mismatch: missing={missing[:5]}, unexpected={unexpected[:5]}"
+            )
 
     def update_rl_weights(self, payload):
         payload = dict(payload)
         payload["group_name"] = f"{payload.get('group_name', 'weight_update_group')}:language"
         tensors, receipt = self.rl_weight_receiver.receive(payload)
+        self._verify_language_closure(tensors, payload)
         self.model.load_weights(tensors)
         if self.radix_cache is not None:
             self.radix_cache.clear_tree_nodes()
@@ -306,6 +337,7 @@ class ModeBackend:
 
     def update_rl_weights_from_tensor(self, payload):
         tensors, receipt = self.rl_weight_receiver.decode_bundle(payload)
+        self._verify_language_closure(tensors, payload)
         self.model.load_weights(tensors)
         if self.radix_cache is not None:
             self.radix_cache.clear_tree_nodes()

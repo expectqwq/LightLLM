@@ -274,10 +274,24 @@ class X2IManager:
                 data = self.rl_weight_receiver.destroy_group(payload.get("group_name", "weight_update_group"))
             elif request.operation == "update_weights_from_distributed":
                 tensors, data = self.rl_weight_receiver.receive(payload)
+                closure = set(self.gen_pipe.rl_weight_closure())
+                if payload.get("full_update", False) and set(tensors) != closure:
+                    raise ValueError(
+                        "X2V parameter closure mismatch: "
+                        f"missing={sorted(closure - set(tensors))[:5]}, "
+                        f"unexpected={sorted(set(tensors) - closure)[:5]}"
+                    )
                 data["apply"] = self.gen_pipe.update_rl_weights(tensors, strict=False)
                 data["policy_version"] = payload["policy_version"]
             elif request.operation == "update_weights_from_tensor":
                 tensors, data = self.rl_weight_receiver.decode_bundle(payload)
+                closure = set(self.gen_pipe.rl_weight_closure())
+                if payload.get("full_update", False) and set(tensors) != closure:
+                    raise ValueError(
+                        "X2V parameter closure mismatch: "
+                        f"missing={sorted(closure - set(tensors))[:5]}, "
+                        f"unexpected={sorted(set(tensors) - closure)[:5]}"
+                    )
                 data["apply"] = self.gen_pipe.update_rl_weights(tensors, strict=False)
                 data["policy_version"] = payload["policy_version"]
             else:

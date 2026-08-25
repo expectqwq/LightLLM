@@ -165,6 +165,13 @@ class VisualModelRpcServer(rpyc.Service):
         else:
             tensors, receipt = self.rl_weight_receiver.decode_bundle(payload)
         prefix = "vision_model.embeddings."
+        closure = {prefix + name for name in self.model.state_dict()}
+        if payload.get("full_update", False) and set(tensors) != closure:
+            raise ValueError(
+                "vision parameter closure mismatch: "
+                f"missing={sorted(closure - set(tensors))[:5]}, "
+                f"unexpected={sorted(set(tensors) - closure)[:5]}"
+            )
         mapped = {name[len(prefix) :]: tensor for name, tensor in tensors.items() if name.startswith(prefix)}
         result = self.model.load_state_dict(mapped, strict=False)
         if result.unexpected_keys:
