@@ -16,6 +16,8 @@ class NeoChatInferStateInfo(LlamaInferStateInfo):
         self.position_sin_h = None
         self.position_cos_w = None
         self.position_sin_w = None
+        self.b_image_token_tag = None
+        self.b_image_token_end = None
 
     def init_some_extra_state(self, model: LlamaTpPartModel):
         LlamaInferStateInfo.init_some_extra_state(self, model)
@@ -23,6 +25,9 @@ class NeoChatInferStateInfo(LlamaInferStateInfo):
             self.b_image_token_tag = torch.zeros([self.position_ids.size(0)], dtype=torch.bool, device="cpu").cuda(
                 non_blocking=True
             )
+            self.b_image_token_end = torch.zeros(
+                [self.position_ids.size(0)], dtype=torch.int32, device="cpu"
+            ).cuda(non_blocking=True)
             self.position_ids = self.get_neo_position(self.multimodal_params)
         else:
             b_position_delta = [0 for _ in range(self.b_seq_len.shape[0])]
@@ -97,5 +102,6 @@ class NeoChatInferStateInfo(LlamaInferStateInfo):
             b_q_seq_len=self.b_q_seq_len,
             b_start_loc=self.b_q_start_loc,
             b_image_token_tag=self.b_image_token_tag,
+            b_image_token_end=self.b_image_token_end,
         )
         return position_ids

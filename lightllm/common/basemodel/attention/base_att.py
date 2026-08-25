@@ -71,6 +71,7 @@ class AttControl:
     nsa_decode: bool = False
     nsa_decode_dict: Dict = None
     image_token_tag: Optional[torch.Tensor] = None
+    image_token_end: Optional[torch.Tensor] = None
 
 
 @dataclass

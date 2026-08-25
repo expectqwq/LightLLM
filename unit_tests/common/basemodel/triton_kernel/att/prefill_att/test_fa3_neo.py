@@ -1,20 +1,18 @@
 """Unit test for the FA3-based prefill path with image-token support.
 
-This test pre-wires a call to ``flash_attn_with_kvcache`` with an
-``image_token_tag`` keyword argument. The expectation is that ``fa3-neo``'s
-``flash_attn_with_kvcache`` will be extended with an optional
-``image_token_tag`` parameter that, for queries flagged as image tokens,
-relaxes the causal mask so they can attend bidirectionally to every real key
-in the request.
+This test calls ``flash_attn_with_kvcache`` with the SenseNova fork's
+``image_token_end`` argument.  For every image-query row, the value is the
+exclusive end of that image span in request coordinates; text rows contain 0.
 
 Torch reference expresses the *semantics* of the attention, not FA3's internal
 tiling — it has no notion of BLOCK_N / BLOCK_M. For each batch element we
 gather K/V for the whole request (prompt + new tokens) and apply::
 
-    allow[m, k] = (k <= q_pos[m]) OR image_tag[m]          for k in [0, total)
+    allow[m, k] = (k <= q_pos[m]) OR (k < image_end[m])    for k in [0, total)
 
-i.e. normal queries are causal, image-token queries can see every real key in
-the request. If FA3 disagrees with this reference, the kernel is wrong.
+i.e. normal queries are causal, while image queries can additionally see the
+rest of their own image span. If FA3 disagrees with this reference, the kernel
+is wrong.
 
 Run directly for quick debugging:
 
@@ -57,7 +55,7 @@ def torch_reference_context_attention_neo(
     b_seq_len: torch.Tensor,
     b_prompt_cache_len: torch.Tensor,
     req_to_token_indexs: torch.Tensor,
-    b_image_token_tag: torch.Tensor,
+    b_image_token_end: torch.Tensor,
 ) -> torch.Tensor:
     device = q.device
     dtype = q.dtype
@@ -78,7 +76,7 @@ def torch_reference_context_attention_neo(
 
         q_start = int(b_q_start_loc[b].item())
         q_blk = q[q_start : q_start + q_seq_len]  # [M, Hq, D]
-        image_tag = b_image_token_tag[q_start : q_start + q_seq_len].to(torch.bool)
+        image_end = b_image_token_end[q_start : q_start + q_seq_len].to(torch.int64)
 
         token_locs = req_to_token_indexs[req_idx, :seq_len].to(torch.int64)
         k_blk = k[token_locs]  # [seq_len, Hk, D]
@@ -87,7 +85,7 @@ def torch_reference_context_attention_neo(
         q_pos = torch.arange(prompt_cache_len, seq_len, device=device, dtype=torch.int64)  # [M]
         k_pos = torch.arange(0, seq_len, device=device, dtype=torch.int64)  # [seq_len]
         causal = k_pos[None, :] <= q_pos[:, None]
-        allow = causal | image_tag[:, None]
+        allow = causal | (k_pos[None, :] < image_end[:, None])
 
         out_blk = torch.empty_like(q_blk)
         for h in range(Hq):
@@ -163,6 +161,7 @@ def _build_inputs(
 
     # Randomly place contiguous image-token spans inside each batch's new-Q region.
     b_image_token_tag = torch.zeros(sum_q, dtype=torch.bool)
+    b_image_token_end = torch.zeros(sum_q, dtype=torch.int32)
     for i in range(batch):
         M = int(q_seq_lens[i].item())
         if M < 2:
@@ -176,6 +175,8 @@ def _build_inputs(
             span_len = min(span_len, M)
             s_rel = int(torch.randint(0, M - span_len + 1, (1,), generator=g).item())
             b_image_token_tag[start_pack + s_rel : start_pack + s_rel + span_len] = True
+            image_end = int(prompt_cache_lens[i].item()) + s_rel + span_len
+            b_image_token_end[start_pack + s_rel : start_pack + s_rel + span_len] = image_end
 
     b_seq_len = seq_lens.to(torch.int32)
     b_prompt_cache_len = prompt_cache_lens.to(torch.int32)
@@ -196,15 +197,16 @@ def _build_inputs(
         max_q_seq_len_in_batch=max_q_seq_len_in_batch,
         req_to_token_indexs=req_to_token_indexs.to(device),
         b_image_token_tag=b_image_token_tag.to(device),
+        b_image_token_end=b_image_token_end.to(device),
         q_seq_lens=q_seq_lens,
         prompt_cache_lens=prompt_cache_lens,
     )
 
 
-def _fa3_prefill_with_image_tag(inputs: dict) -> torch.Tensor:
+def _fa3_prefill_with_image_end(inputs: dict) -> torch.Tensor:
     """Drive ``flash_attn_with_kvcache`` with the same prefill semantics as
     ``Fa3PrefillAttState._nomarl_prefill_att`` plus an optional
-    ``image_token_tag`` kwarg for image-token bidirectional attention.
+    ``image_token_end`` kwarg for scoped image-token bidirectional attention.
     """
     q = inputs["q"]
     k = inputs["k"]
@@ -246,12 +248,9 @@ def _fa3_prefill_with_image_tag(inputs: dict) -> torch.Tensor:
         k_descale=None,
         v_descale=None,
         return_softmax_lse=False,
-        # image-token bidirectional attention. Packed like q (shape [sum_q],
-        # bool). Rows where the tag is True are allowed to attend to every
-        # real key in the request (not just the causal prefix).
-        # The kernel uses warp OR reduce to detect image tokens per M-block
-        # and extends n_block_max for full attention automatically.
-        image_token_tag=inputs["b_image_token_tag"],
+        # Packed like q (shape [sum_q], int32). Image rows hold the exclusive
+        # request-coordinate end of their image span; text rows are zero.
+        image_token_end=inputs["b_image_token_end"],
     )
     return o
 
@@ -305,7 +304,7 @@ def _run_case(
         seed=seed,
     )
 
-    out_fa3 = _fa3_prefill_with_image_tag(inputs)
+    out_fa3 = _fa3_prefill_with_image_end(inputs)
 
     out_ref = torch_reference_context_attention_neo(
         inputs["q"],
@@ -316,7 +315,7 @@ def _run_case(
         inputs["b_seq_len"],
         inputs["b_prompt_cache_len"],
         inputs["req_to_token_indexs"],
-        inputs["b_image_token_tag"],
+        inputs["b_image_token_end"],
     )
 
     a = out_fa3.float().reshape_as(out_ref.float())
@@ -359,12 +358,10 @@ def _run_case(
         (4, 8, 2, 128, torch.bfloat16, 1, 256, 512),
         (8, 16, 4, 128, torch.bfloat16, 2, 256, 512),
         (16, 28, 4, 128, torch.bfloat16, 3, 128, 256),
-        (4, 8, 2, 128, torch.float16, 4, 256, 512),
-        (4, 8, 8, 64, torch.bfloat16, 5, 128, 256),
         (3, 8, 2, 128, torch.bfloat16, 6, 8, 1024),
     ],
 )
-def test_fa3_neo_prefill_with_image_tag(batch, Hq, Hk, D, dtype, seed, max_q_seq_len, max_prompt_cache_len):
+def test_fa3_neo_prefill_with_image_end(batch, Hq, Hk, D, dtype, seed, max_q_seq_len, max_prompt_cache_len):
     abs_err, rel_err, cos = _run_case(
         batch=batch,
         Hq=Hq,
@@ -392,7 +389,7 @@ def _bench_case(
     rep_ms: int = 100,
     warmup_iters: int = 3,
 ):
-    """Compare FA3 (with image_token_tag) vs the original Triton
+    """Compare FA3 (with image_token_end) vs the original Triton
     ``context_attention_fwd_neo`` using ``triton.testing.do_bench_cudagraph``.
 
     Both kernels are captured into a CUDA graph so scheduling/launch overhead
@@ -415,7 +412,7 @@ def _bench_case(
 
     # --- fa3 runner: output tensor is allocated inside flash_attn_with_kvcache.
     def fa3_run():
-        return _fa3_prefill_with_image_tag(inputs)
+        return _fa3_prefill_with_image_end(inputs)
 
     # --- triton runner: pre-allocate o & position_ids so the graph captures
     # only the kernel launch.

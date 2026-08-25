@@ -9,14 +9,21 @@ try:
     from flash_attn_interface import flash_attn_with_kvcache as flash_attn_with_kvcache_neo
     import inspect
 
-    # Verify this is the neo-patched FA3 build (with image_token_tag support),
+    # The current SenseNova FA3 fork uses image_token_end so each image query
+    # sees only the end of its own image span.  Keep compatibility with the
+    # older boolean image_token_tag ABI, but prefer the scoped representation.
     _sig = inspect.signature(flash_attn_with_kvcache_neo)
-    if "image_token_tag" not in _sig.parameters:
-        raise ImportError("flash_attn_interface found but missing image_token_tag support (need neo build)")
+    if "image_token_end" in _sig.parameters:
+        FA3_NEO_ARGUMENT = "image_token_end"
+    elif "image_token_tag" in _sig.parameters:
+        FA3_NEO_ARGUMENT = "image_token_tag"
+    else:
+        raise ImportError("flash_attn_interface found but missing the Neo image-token argument")
 
     HAS_FLASH_ATTN_INTERFACE = True
 except ImportError:
     flash_attn_with_kvcache_neo = None
+    FA3_NEO_ARGUMENT = None
     HAS_FLASH_ATTN_INTERFACE = False
 from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.common.basemodel.triton_kernel.fa3_utils import page_table_copy
@@ -107,16 +114,21 @@ class Fa3PrefillAttState(BasePrefillAttState):
         Lq = q.shape[-1]
         sm_scale = 1.0 / (Lq ** 0.5)
 
-        # neo_chat*: image-token bidirectional attention requires flash_attn_interface
-        # (sgl_kernel's flash_attn_with_kvcache does not support image_token_tag).
-        if att_control.image_token_tag is not None:
+        # neo_chat*: image-token bidirectional attention requires the patched
+        # flash_attn_interface; sgl_kernel does not expose this mask control.
+        if att_control.image_token_tag is not None or att_control.image_token_end is not None:
             if not HAS_FLASH_ATTN_INTERFACE:
                 raise ImportError(
-                    "flash_attn_interface (fa3-neo) is required for image_token_tag bidirectional "
+                    "flash_attn_interface (fa3-neo) is required for image-token bidirectional "
                     "attention. Install it or set LIGHTLLM_NEO_PREFILL_TRITON_BACKEND=1 to use the "
                     "triton fallback."
                 )
-            extra_kwargs = {"image_token_tag": att_control.image_token_tag}
+            if FA3_NEO_ARGUMENT == "image_token_end":
+                if att_control.image_token_end is None:
+                    raise RuntimeError("FA3-Neo image_token_end metadata was not built for this prefill")
+                extra_kwargs = {"image_token_end": att_control.image_token_end}
+            else:
+                extra_kwargs = {"image_token_tag": att_control.image_token_tag}
             o = flash_attn_with_kvcache_neo(
                 q=q,
                 k_cache=k.view(k.shape[0], 1, k.shape[1], k.shape[2]),

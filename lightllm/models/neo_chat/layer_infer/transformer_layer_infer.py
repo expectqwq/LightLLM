@@ -122,6 +122,7 @@ class NeoChatTransformerLayerInfer(Qwen3TransformerLayerInfer):
 
         att_control = AttControl()
         att_control.image_token_tag = getattr(infer_state, "b_image_token_tag", None)
+        att_control.image_token_end = getattr(infer_state, "b_image_token_end", None)
 
         o_tensor = infer_state.prefill_att_state.prefill_att(
             q=_q,
