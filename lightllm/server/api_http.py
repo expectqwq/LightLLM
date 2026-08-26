@@ -366,7 +366,10 @@ async def rl_rollouts(request: RLRolloutRequest, raw_request: Request):
 def _trace_path(bundle_id: str):
     if not re.fullmatch(r"[a-f0-9]{32}", bundle_id):
         raise HTTPException(status_code=400, detail="invalid trace bundle id")
-    path = os.path.join(os.getenv("MOVA_RL_TRACE_DIR", "/tmp/mova_rl_traces"), f"{bundle_id}.safetensors")
+    path = os.path.join(
+        os.getenv("MOVA_RL_TRACE_DIR", "/dev/shm/mova_rl_traces"),
+        f"{bundle_id}.safetensors",
+    )
     if os.path.isfile(path):
         ttl = int(os.getenv("MOVA_RL_TRACE_TTL", "3600"))
         if ttl <= 0:
@@ -391,6 +394,82 @@ async def delete_rl_trace(bundle_id: str):
         raise HTTPException(status_code=404, detail="trace bundle not found")
     os.unlink(path)
     return {"deleted": bundle_id}
+
+
+@app.websocket("/v1/rl/traces/ws")
+async def stream_rl_traces(websocket: WebSocket):
+    """Stream many SDE bundles as raw safetensors frames, then delete them.
+
+    The JSON rollout response remains small and carries only bundle IDs.  A
+    trainer opens one side-channel per rollout group, receives each bundle in
+    bounded binary frames, and never performs one HTTP file download per image.
+    The producer/consumer hand-off lives in ``/dev/shm`` by default, so neither
+    side writes a persistent trace artifact.
+    """
+
+    await websocket.accept()
+    pending: list[tuple[str, str]] = []
+    try:
+        request = await websocket.receive_json()
+        bundle_ids = request.get("bundle_ids") if isinstance(request, dict) else None
+        if (
+            not isinstance(bundle_ids, list)
+            or not bundle_ids
+            or len(bundle_ids) > 256
+            or len(set(bundle_ids)) != len(bundle_ids)
+        ):
+            raise ValueError("bundle_ids must contain 1..256 distinct trace IDs")
+        for bundle_id in bundle_ids:
+            if not isinstance(bundle_id, str):
+                raise ValueError("trace bundle IDs must be strings")
+            pending.append((bundle_id, _trace_path(bundle_id)))
+        missing = [bundle_id for bundle_id, path in pending if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError(f"trace bundles not found: {missing[:8]}")
+        await websocket.send_json(
+            {
+                "schema": "mova.rl.sde_stream.v1",
+                "bundle_count": len(pending),
+            }
+        )
+        chunk_bytes = 8 * 1024 * 1024
+        for bundle_id, path in pending:
+            size = os.path.getsize(path)
+            if size <= 0:
+                raise RuntimeError(f"trace bundle is empty: {bundle_id}")
+            await websocket.send_json(
+                {
+                    "bundle_id": bundle_id,
+                    "size": size,
+                    "chunk_bytes": chunk_bytes,
+                }
+            )
+            with open(path, "rb") as handle:
+                sent = 0
+                while block := handle.read(chunk_bytes):
+                    await websocket.send_bytes(block)
+                    sent += len(block)
+            if sent != size:
+                raise RuntimeError(f"trace bundle changed while streaming: {bundle_id}")
+            os.unlink(path)
+        pending.clear()
+        await websocket.send_json({"complete": True})
+        await websocket.close(code=1000)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        try:
+            await websocket.send_json({"error": str(exc)})
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+    finally:
+        # A disconnected trainer must not strand high-frequency rollout state.
+        for _bundle_id, path in pending:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)

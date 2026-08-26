@@ -177,6 +177,11 @@ async def _one_rollout(
                     "image": _raw_image_to_data_url(encoded, image_config.image_type),
                     "trace_bundle_key": bundle_id,
                     "sde_geometry": {
+                        # generate_image may apply the official dynamic-resolution
+                        # rule for image-conditioned requests. Return the actual
+                        # X2V geometry, not merely the requested policy default.
+                        "height": int(x2i_params.height),
+                        "width": int(x2i_params.width),
                         "image_steps": request.image_policy.image_steps,
                         "timestep_shift": request.image_policy.timestep_shift,
                         "t_eps": request.image_policy.t_eps,

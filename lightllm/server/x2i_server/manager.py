@@ -92,7 +92,7 @@ class X2IManager:
                 from lightx2v.rl.trace_store import TraceStore
 
                 self.rl_trace_store = TraceStore(
-                    root=os.getenv("MOVA_RL_TRACE_DIR", "/tmp/mova_rl_traces"),
+                    root=os.getenv("MOVA_RL_TRACE_DIR", "/dev/shm/mova_rl_traces"),
                     ttl_seconds=int(os.getenv("MOVA_RL_TRACE_TTL", "3600")),
                 )
                 self.rl_weight_receiver = DistributedWeightReceiver(
@@ -125,9 +125,14 @@ class X2IManager:
             self.gen_pipe.runner.set_kvcache(past_kv_cache, past_kv_cache_text)
             if hasattr(param, "rl_config"):
                 self.gen_pipe.runner.scheduler.infer_steps = param.steps
+                # X2IParams crosses shared memory with a signed C integer seed,
+                # while NumPy's legacy RNG (used by LightX2V seed_all) accepts
+                # only uint32 values. Preserve the seed's bit pattern so half
+                # of concurrent RL image actions do not fail nondeterministically.
+                rl_seed = (int(param.seed) & 0xFFFFFFFF) if param.first_image else None
                 image, trace = self.gen_pipe.generate_rl(
                     rl_config=param.rl_config,
-                    seed=param.seed if param.first_image else None,
+                    seed=rl_seed,
                     save_result_path="",
                     target_shape=[param.height, param.width],
                 )
@@ -165,9 +170,10 @@ class X2IManager:
             self.gen_pipe.runner.set_kvcache_i2i(past_kv_cache, past_kv_cache_text, past_kv_cache_img)
             if hasattr(param, "rl_config"):
                 self.gen_pipe.runner.scheduler.infer_steps = param.steps
+                rl_seed = int(param.seed + param.past_kvcache_img.img_len + i) & 0xFFFFFFFF
                 image, trace = self.gen_pipe.generate_rl(
                     rl_config=param.rl_config,
-                    seed=param.seed + param.past_kvcache_img.img_len + i,
+                    seed=rl_seed,
                     save_result_path="",
                     target_shape=[param.height, param.width],
                 )
