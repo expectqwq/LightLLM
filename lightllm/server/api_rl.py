@@ -58,6 +58,14 @@ async def _one_rollout(
     raw_request: Request,
     manager: HttpServerManager,
 ) -> dict[str, Any]:
+    if request.max_sequence_length > manager.max_req_total_len:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "RL max_sequence_length exceeds the serving engine's "
+                f"max_req_total_len={manager.max_req_total_len}"
+            ),
+        )
     modalities = ["text"] if request.modality == "ti2t" else ["text", "image"]
     image_config = None if request.modality == "ti2t" else _image_config(request.image_policy, seed)
     chat_v2 = ChatCompletionRequestV2(
@@ -226,8 +234,7 @@ async def rl_rollouts(request: RLRolloutRequest, raw_request: Request, manager: 
             },
         )
     # Submit all members of one RL group together so LightLLM's native
-    # continuous scheduler can batch their prefill/decode work.  LightX2V is
-    # deliberately still single-request in this smoke milestone.
+    # continuous scheduler can batch their prefill/decode work.
     rollouts = await asyncio.gather(
         *(_one_rollout(request, seed, raw_request, manager) for seed in request.seeds)
     )
