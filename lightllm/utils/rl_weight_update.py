@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import os
 
 import torch
 import torch.distributed as dist
@@ -39,16 +40,57 @@ class DistributedWeightReceiver:
         if name in self.groups:
             raise RuntimeError(f"weight group {name} already exists")
         backend = payload.get("backend", "nccl")
+        default_bound = (
+            dist.group.WORLD.bound_device_id if dist.is_initialized() else None
+        )
+        print(
+            "RL_WEIGHT_GROUP_INIT_BEGIN "
+            f"pid={os.getpid()} consumer={self.consumer} name={name} "
+            f"rank={int(rank)} world_size={int(payload['world_size'])} "
+            f"port={int(payload['master_port'])} backend={backend} "
+            f"device={self.device} default_bound={default_bound}",
+            flush=True,
+        )
         group = init_custom_process_group(
             backend=backend,
             init_method=f"tcp://{payload['master_address']}:{int(payload['master_port'])}",
             world_size=int(payload["world_size"]),
             rank=int(rank),
             group_name=name,
-            device_id=self.device if backend == "nccl" else None,
+            # External publishers are not ranks in the serving default group.
+            # Passing device_id enables PyTorch's device-bound split path and
+            # makes NCCL wait for ranks that can never join this communicator.
+            device_id=None,
+        )
+        print(
+            f"RL_WEIGHT_GROUP_CREATED pid={os.getpid()} consumer={self.consumer} "
+            f"name={name}",
+            flush=True,
         )
         self.groups[name] = (group, backend)
-        return {"group_name": name, "rank": int(rank), "backend": backend}
+        warmed_up = bool(payload.get("warmup", False))
+        if warmed_up:
+            transport_device = self.device if backend == "nccl" else torch.device("cpu")
+            probe = torch.empty(1, dtype=torch.int64, device=transport_device)
+            print(
+                f"RL_WEIGHT_GROUP_WARMUP_BEGIN pid={os.getpid()} "
+                f"consumer={self.consumer} name={name} device={transport_device}",
+                flush=True,
+            )
+            dist.broadcast(probe, src=0, group=group)
+            if int(probe.item()) != 20260827:
+                raise RuntimeError(f"weight group {name} failed its warmup probe")
+            print(
+                f"RL_WEIGHT_GROUP_WARMUP_DONE pid={os.getpid()} "
+                f"consumer={self.consumer} name={name}",
+                flush=True,
+            )
+        return {
+            "group_name": name,
+            "rank": int(rank),
+            "backend": backend,
+            "warmed_up": warmed_up,
+        }
 
     def destroy_group(self, name: str = "weight_update_group") -> dict:
         entry = self.groups.pop(name, None)

@@ -13,6 +13,7 @@ class InitWeightsUpdateGroupRequest(BaseModel):
     group_name: str = "weight_update_group"
     backend: str = "nccl"
     master_ports: dict[Literal["language", "vision", "x2v"], int] | None = None
+    warmup: bool = False
 
 
 class DistributedWeightsRequest(BaseModel):
