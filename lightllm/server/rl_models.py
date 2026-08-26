@@ -20,7 +20,6 @@ class DistributedWeightsRequest(BaseModel):
     names: list[str]
     dtypes: list[str]
     shapes: list[list[int]]
-    checksums: list[str]
     assignments: dict[str, list[Literal["language", "vision", "x2v"]]] = Field(default_factory=dict)
     required: dict[str, list[str]] = Field(default_factory=dict)
     policy_version: str
@@ -31,7 +30,7 @@ class DistributedWeightsRequest(BaseModel):
     @model_validator(mode="after")
     def validate_columns(self):
         size = len(self.names)
-        if not size or not (size == len(self.dtypes) == len(self.shapes) == len(self.checksums)):
+        if not size or not (size == len(self.dtypes) == len(self.shapes)):
             raise ValueError("weight manifest columns must have the same non-zero length")
         if len(set(self.names)) != size:
             raise ValueError("weight manifest contains duplicate names")
@@ -44,7 +43,6 @@ class DestroyWeightsUpdateGroupRequest(BaseModel):
 
 class TensorWeightsRequest(BaseModel):
     serialized_safetensors: str
-    checksums: dict[str, str]
     assignments: dict[str, list[Literal["language", "vision", "x2v"]]] = Field(default_factory=dict)
     required: dict[str, list[str]] = Field(default_factory=dict)
     policy_version: str

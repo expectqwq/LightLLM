@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import base64
 import os
 
@@ -22,11 +21,6 @@ _DTYPES = {
     "torch.uint8": torch.uint8,
     "torch.bool": torch.bool,
 }
-
-
-def tensor_checksum(tensor: torch.Tensor) -> str:
-    raw = tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
-    return hashlib.sha256(raw).hexdigest()
 
 
 class DistributedWeightReceiver:
@@ -107,26 +101,22 @@ class DistributedWeightReceiver:
         names = payload["names"]
         dtypes = payload["dtypes"]
         shapes = payload["shapes"]
-        checksums = payload["checksums"]
         assignments = payload.get("assignments", {})
-        if not (len(names) == len(dtypes) == len(shapes) == len(checksums)):
+        if not (len(names) == len(dtypes) == len(shapes)):
             raise ValueError("weight manifest columns have different lengths")
         if payload.get("buckets"):
             return self._receive_buckets(payload, group, backend)
         selected: dict[str, torch.Tensor] = {}
-        received: dict[str, str] = {}
-        for tensor_name, dtype_name, shape, expected in zip(names, dtypes, shapes, checksums):
+        received: list[str] = []
+        for tensor_name, dtype_name, shape in zip(names, dtypes, shapes):
             if dtype_name not in _DTYPES:
                 raise ValueError(f"unsupported tensor dtype {dtype_name}")
             tensor = torch.empty(tuple(shape), dtype=_DTYPES[dtype_name], device=transport_device)
             dist.broadcast(tensor, src=0, group=group)
-            actual = tensor_checksum(tensor)
-            if actual != expected:
-                raise ValueError(f"checksum mismatch for {tensor_name}")
             owners = assignments.get(tensor_name, [])
             if not owners or self.consumer in owners:
                 selected[tensor_name] = tensor.to(self.device)
-                received[tensor_name] = actual
+                received.append(tensor_name)
         required = set(payload.get("required", {}).get(self.consumer, []))
         missing = sorted(required - set(selected))
         if missing:
@@ -134,7 +124,6 @@ class DistributedWeightReceiver:
         return selected, {
             "consumer": self.consumer,
             "received_names": sorted(received),
-            "checksums": received,
             "closure_size": len(required),
         }
 
@@ -142,11 +131,10 @@ class DistributedWeightReceiver:
         names = payload["names"]
         dtypes = payload["dtypes"]
         shapes = payload["shapes"]
-        checksums = payload["checksums"]
         assignments = payload.get("assignments", {})
         transport_device = self.device if backend == "nccl" else torch.device("cpu")
         selected = {}
-        received = {}
+        received = []
         received_bucket_count = 0
         for bucket in payload["buckets"]:
             consumers = bucket.get("consumers")
@@ -158,8 +146,6 @@ class DistributedWeightReceiver:
             flat = torch.empty(int(bucket["numel"]), dtype=_DTYPES[dtype_name], device=transport_device)
             dist.broadcast(flat, src=0, group=group)
             received_bucket_count += 1
-            if tensor_checksum(flat) != bucket["checksum"]:
-                raise ValueError(f"bucket checksum mismatch for {bucket['id']}")
             offset = 0
             for entry_index in bucket["entry_indices"]:
                 entry_index = int(entry_index)
@@ -169,12 +155,10 @@ class DistributedWeightReceiver:
                     numel *= int(dimension)
                 tensor = flat[offset : offset + numel].reshape(tuple(shapes[entry_index]))
                 offset += numel
-                if tensor_checksum(tensor) != checksums[entry_index]:
-                    raise ValueError(f"checksum mismatch for {name}")
                 owners = assignments.get(name, [])
                 if not owners or self.consumer in owners:
                     selected[name] = tensor.to(self.device).clone()
-                    received[name] = checksums[entry_index]
+                    received.append(name)
             if offset != flat.numel():
                 raise ValueError(f"bucket geometry mismatch for {bucket['id']}")
         required = set(payload.get("required", {}).get(self.consumer, []))
@@ -184,24 +168,20 @@ class DistributedWeightReceiver:
         return selected, {
             "consumer": self.consumer,
             "received_names": sorted(received),
-            "checksums": received,
             "closure_size": len(required),
             "bucket_count": received_bucket_count,
         }
 
     def decode_bundle(self, payload: dict) -> tuple[dict[str, torch.Tensor], dict]:
         tensors = load_safetensors(base64.b64decode(payload["serialized_safetensors"]))
-        checksums = payload["checksums"]
         assignments = payload.get("assignments", {})
         selected = {}
-        received = {}
+        received = []
         for name, tensor in tensors.items():
-            if name not in checksums or tensor_checksum(tensor) != checksums[name]:
-                raise ValueError(f"checksum mismatch for {name}")
             owners = assignments.get(name, [])
             if not owners or self.consumer in owners:
                 selected[name] = tensor.to(self.device)
-                received[name] = checksums[name]
+                received.append(name)
         required = set(payload.get("required", {}).get(self.consumer, []))
         missing = sorted(required - set(selected))
         if missing:
@@ -209,6 +189,5 @@ class DistributedWeightReceiver:
         return selected, {
             "consumer": self.consumer,
             "received_names": sorted(received),
-            "checksums": received,
             "closure_size": len(required),
         }
